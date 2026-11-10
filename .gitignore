@@ -1,0 +1,13 @@
+.DS_Store
+
+# Environment files
+.env
+.env.*
+!.env.example
+
+# Go build output
+backend/geopulse
+
+# Frontend dependencies and build output
+frontend/node_modules/
+frontend/dist/

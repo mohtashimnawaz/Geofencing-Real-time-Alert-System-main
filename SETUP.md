@@ -25,9 +25,10 @@ npm run dev
 ```
 
 Open <http://localhost:5173>. The API listens on `http://localhost:8080`.
-The current implementation uses an in-memory repository, so data resets when the
-backend restarts. The repository is isolated behind the service store and can be
-replaced with PostgreSQL/PostGIS for production persistence.
+The backend persists its in-memory repository to `geopulse-data.json` by default.
+Set `DATA_FILE` to change the location, or set it to an empty value to disable
+persistence. Docker Compose stores this file in the named `geopulse-data`
+volume. For production scale, replace the store with PostgreSQL/PostGIS.
 
 ## Docker Compose
 
@@ -73,8 +74,15 @@ curl -X POST http://localhost:8080/vehicles/location \
 
 Other endpoints are `GET /geofences`, `GET /vehicles`,
 `GET /vehicles/location/{vehicle_id}`, `GET /alerts`, and
-`GET /violations/history`. Every JSON response includes `time_ns`. Connect a
-WebSocket client to `/ws/alerts` to receive matching entry and exit events.
+`GET /violations/history`. Alert rules can be disabled with
+`PATCH /alerts/{alert_id}` and removed with `DELETE /alerts/{alert_id}`.
+Every JSON response includes `time_ns`. Connect a WebSocket client to
+`/ws/alerts` to receive matching entry and exit events.
+
+The dashboard includes a Leaflet map, category and history filters, vehicle
+status cards, alert rule management, loading states, and paginated violation
+history. The map uses OpenStreetMap tiles and needs network access in the
+browser.
 
 ## Architecture
 

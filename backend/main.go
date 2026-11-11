@@ -68,10 +68,54 @@ type store struct {
 	violations []Violation
 	next       uint64
 	clients    map[*websocket.Conn]struct{}
+	dataFile   string
+	alerts     chan map[string]any
 }
 
-func newStore() *store {
-	return &store{geofences: map[string]Geofence{}, vehicles: map[string]Vehicle{}, locations: map[string]Location{}, inside: map[string]map[string]bool{}, rules: map[string]AlertRule{}, clients: map[*websocket.Conn]struct{}{}}
+type persistedStore struct {
+	Geofences  map[string]Geofence
+	Vehicles   map[string]Vehicle
+	Locations  map[string]Location
+	Inside     map[string]map[string]bool
+	Rules      map[string]AlertRule
+	Violations []Violation
+	Next       uint64
+}
+
+func newStore(dataFile string) *store {
+	s := &store{geofences: map[string]Geofence{}, vehicles: map[string]Vehicle{}, locations: map[string]Location{}, inside: map[string]map[string]bool{}, rules: map[string]AlertRule{}, clients: map[*websocket.Conn]struct{}{}, dataFile: dataFile, alerts: make(chan map[string]any, 128)}
+	if dataFile != "" {
+		data, err := os.ReadFile(dataFile)
+		if err == nil {
+			var saved persistedStore
+			if json.Unmarshal(data, &saved) == nil {
+				s.geofences, s.vehicles, s.locations, s.inside, s.rules, s.violations, s.next = saved.Geofences, saved.Vehicles, saved.Locations, saved.Inside, saved.Rules, saved.Violations, saved.Next
+			} else {
+				log.Printf("unable to parse persisted data %q", dataFile)
+			}
+		} else if !os.IsNotExist(err) {
+			log.Printf("unable to read persisted data %q: %v", dataFile, err)
+		}
+	}
+	return s
+}
+func (s *store) persistLocked() {
+	if s.dataFile == "" {
+		return
+	}
+	data, err := json.Marshal(persistedStore{s.geofences, s.vehicles, s.locations, s.inside, s.rules, s.violations, s.next})
+	if err != nil {
+		log.Printf("unable to serialize persisted data: %v", err)
+		return
+	}
+	tmp := s.dataFile + ".tmp"
+	if err := os.WriteFile(tmp, data, 0600); err != nil {
+		log.Printf("unable to write persisted data: %v", err)
+		return
+	}
+	if err := os.Rename(tmp, s.dataFile); err != nil {
+		log.Printf("unable to replace persisted data: %v", err)
+	}
 }
 func (s *store) id(prefix string) string { s.next++; return fmt.Sprintf("%s_%d", prefix, s.next) }
 func writeJSON(w http.ResponseWriter, status int, value any, started time.Time) {
@@ -149,6 +193,8 @@ func (s *server) handler(w http.ResponseWriter, r *http.Request) {
 		s.configureAlert(w, r)
 	case r.URL.Path == "/alerts":
 		s.alerts(w, r)
+	case strings.HasPrefix(r.URL.Path, "/alerts/"):
+		s.manageAlert(w, r)
 	case r.URL.Path == "/violations/history":
 		s.history(w, r)
 	case r.URL.Path == "/ws/alerts":
@@ -173,6 +219,7 @@ func (s *server) geofences(w http.ResponseWriter, r *http.Request) {
 		s.db.mu.Lock()
 		g := Geofence{ID: s.db.id("geo"), Name: strings.TrimSpace(in.Name), Description: in.Description, Coordinates: in.Coordinates, Category: in.Category, CreatedAt: time.Now().UTC()}
 		s.db.geofences[g.ID] = g
+		s.db.persistLocked()
 		s.db.mu.Unlock()
 		writeJSON(w, 201, map[string]any{"id": g.ID, "name": g.Name, "status": "active"}, start)
 		return
@@ -215,6 +262,7 @@ func (s *server) vehicles(w http.ResponseWriter, r *http.Request) {
 		}
 		v := Vehicle{ID: s.db.id("veh"), VehicleNumber: in.VehicleNumber, DriverName: in.DriverName, VehicleType: in.VehicleType, Phone: in.Phone, Status: "active", CreatedAt: time.Now().UTC()}
 		s.db.vehicles[v.ID] = v
+		s.db.persistLocked()
 		s.db.mu.Unlock()
 		writeJSON(w, 201, map[string]any{"id": v.ID, "vehicle_number": v.VehicleNumber, "status": v.Status}, start)
 		return
@@ -289,9 +337,10 @@ func (s *server) updateLocation(w http.ResponseWriter, r *http.Request) {
 			events = append(events, s.makeEventLocked(v, s.db.geofences[id], "exit", in.Latitude, in.Longitude, ts))
 		}
 	}
+	s.db.persistLocked()
 	s.db.mu.Unlock()
 	for _, event := range events {
-		s.broadcast(event)
+		s.queueAlert(event)
 	}
 	writeJSON(w, 200, map[string]any{"vehicle_id": in.VehicleID, "location_updated": true, "current_geofences": matches}, start)
 }
@@ -353,8 +402,46 @@ func (s *server) configureAlert(w http.ResponseWriter, r *http.Request) {
 	}
 	a := AlertRule{ID: s.db.id("alert"), GeofenceID: in.GeofenceID, VehicleID: in.VehicleID, EventType: in.EventType, Status: "active", CreatedAt: time.Now().UTC()}
 	s.db.rules[a.ID] = a
+	s.db.persistLocked()
 	s.db.mu.Unlock()
 	writeJSON(w, 201, map[string]any{"alert_id": a.ID, "geofence_id": a.GeofenceID, "vehicle_id": a.VehicleID, "event_type": a.EventType, "status": a.Status}, start)
+}
+func (s *server) manageAlert(w http.ResponseWriter, r *http.Request) {
+	start := time.Now()
+	id := strings.TrimPrefix(r.URL.Path, "/alerts/")
+	if id == "" {
+		errorJSON(w, start, 404, "alert not found")
+		return
+	}
+	s.db.mu.Lock()
+	a, ok := s.db.rules[id]
+	if !ok {
+		s.db.mu.Unlock()
+		errorJSON(w, start, 404, "alert not found")
+		return
+	}
+	switch r.Method {
+	case http.MethodDelete:
+		delete(s.db.rules, id)
+	case http.MethodPatch:
+		var in struct {
+			Status string `json:"status"`
+		}
+		if decode(r, &in) != nil || (in.Status != "active" && in.Status != "inactive") {
+			s.db.mu.Unlock()
+			errorJSON(w, start, 400, "status must be active or inactive")
+			return
+		}
+		a.Status = in.Status
+		s.db.rules[id] = a
+	default:
+		s.db.mu.Unlock()
+		errorJSON(w, start, 405, "method not allowed")
+		return
+	}
+	s.db.persistLocked()
+	s.db.mu.Unlock()
+	writeJSON(w, 200, map[string]any{"alert_id": id, "status": a.Status, "deleted": r.Method == http.MethodDelete}, start)
 }
 func (s *server) alerts(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
@@ -424,7 +511,7 @@ func (s *server) history(w http.ResponseWriter, r *http.Request) {
 		}
 		out = append(out, v)
 	}
-	total := len(s.db.violations)
+	total := len(out)
 	s.db.mu.RUnlock()
 	writeJSON(w, 200, map[string]any{"violations": out, "total_count": total}, start)
 }
@@ -453,12 +540,31 @@ func (s *server) broadcast(event map[string]any) {
 		_ = c.WriteJSON(event)
 	}
 }
+func (s *server) queueAlert(event map[string]any) {
+	if event == nil {
+		return
+	}
+	select {
+	case s.db.alerts <- event:
+	default:
+		log.Printf("dropping alert because the delivery queue is full")
+	}
+}
 func main() {
 	port := os.Getenv("PORT")
 	if port == "" {
 		port = "8080"
 	}
-	s := &server{db: newStore(), upgrader: websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}}
+	dataFile := os.Getenv("DATA_FILE")
+	if dataFile == "" {
+		dataFile = "geopulse-data.json"
+	}
+	s := &server{db: newStore(dataFile), upgrader: websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}}
+	go func() {
+		for event := range s.db.alerts {
+			s.broadcast(event)
+		}
+	}()
 	log.Printf("geofencing API listening on :%s", port)
 	log.Fatal(http.ListenAndServe(":"+port, http.HandlerFunc(s.handler)))
 }

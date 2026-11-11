@@ -7,6 +7,8 @@
 
 # Go build output
 backend/geopulse
+geopulse-data.json
+backend/geopulse-data.json
 
 # Frontend dependencies and build output
 frontend/node_modules/
